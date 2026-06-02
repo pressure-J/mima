@@ -11,7 +11,8 @@ import numpy as np
 import math
 from pathlib import Path
 
-OUTPUT_DIR = Path("E:/gaoxiaom/figures")
+ROOT_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = ROOT_DIR / "figures"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # 设置中文字体
