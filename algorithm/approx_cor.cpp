@@ -166,7 +166,7 @@ const vector<Transition>& enumerate_one_round(u32 input_mask) {
     return ONE_ROUND_CACHE.emplace(input_mask, build_one_round(input_mask)).first->second;
 }
 
-unordered_map<u32, double> exact_distribution(u32 u, int rounds) {
+unordered_map<u32, double> exact_distribution(u32 u, int rounds, size_t max_states = 200000) {
     unordered_map<u32, double> current;
     current.reserve(1024);
     current[u] = 1.0;
@@ -176,24 +176,32 @@ unordered_map<u32, double> exact_distribution(u32 u, int rounds) {
         next.reserve(current.size() * 8);
 
         for (const auto& [mask, corr] : current) {
-            if (active_nibbles(mask) <= 2) {
-                const auto& transitions = enumerate_one_round(mask);
-                for (const auto& transition : transitions) {
-                    next[transition.mask] += corr * transition.corr;
-                }
-            } else {
-                const auto transitions = build_one_round(mask);
-                for (const auto& transition : transitions) {
-                    next[transition.mask] += corr * transition.corr;
-                }
+            // Always use cached transitions (works for any number of active nibbles)
+            const auto& transitions = enumerate_one_round(mask);
+            for (const auto& transition : transitions) {
+                next[transition.mask] += corr * transition.corr;
             }
         }
 
+        // Remove tiny values
         for (auto it = next.begin(); it != next.end();) {
             if (fabs(it->second) <= 1e-18) {
                 it = next.erase(it);
             } else {
                 ++it;
+            }
+        }
+
+        // Beam pruning: if too many states, keep only the strongest
+        if (next.size() > max_states) {
+            vector<pair<u32, double>> items(next.begin(), next.end());
+            nth_element(items.begin(), items.begin() + static_cast<ptrdiff_t>(max_states), items.end(),
+                [](const pair<u32, double>& a, const pair<u32, double>& b) {
+                    return fabs(a.second) > fabs(b.second);
+                });
+            next.clear();
+            for (size_t i = 0; i < max_states; ++i) {
+                next[items[i].first] = items[i].second;
             }
         }
 
@@ -285,16 +293,10 @@ vector<Entry> search_positive_score_entries(int max_rounds) {
             unordered_map<u32, double> next;
             next.reserve(current.size() * 8);
             for (const auto& [mask, corr] : current) {
-                if (active_nibbles(mask) <= 2) {
-                    const auto& transitions = enumerate_one_round(mask);
-                    for (const auto& transition : transitions) {
-                        next[transition.mask] += corr * transition.corr;
-                    }
-                } else {
-                    const auto transitions = build_one_round(mask);
-                    for (const auto& transition : transitions) {
-                        next[transition.mask] += corr * transition.corr;
-                    }
+                // Always use cached transitions
+                const auto& transitions = enumerate_one_round(mask);
+                for (const auto& transition : transitions) {
+                    next[transition.mask] += corr * transition.corr;
                 }
             }
 
@@ -303,6 +305,20 @@ vector<Entry> search_positive_score_entries(int max_rounds) {
                     it = next.erase(it);
                 } else {
                     ++it;
+                }
+            }
+
+            // Beam pruning for r>=4: keep only the strongest states
+            constexpr size_t MAX_STATES = 200000;
+            if (next.size() > MAX_STATES) {
+                vector<pair<u32, double>> items(next.begin(), next.end());
+                nth_element(items.begin(), items.begin() + static_cast<ptrdiff_t>(MAX_STATES), items.end(),
+                    [](const pair<u32, double>& a, const pair<u32, double>& b) {
+                        return fabs(a.second) > fabs(b.second);
+                    });
+                next.clear();
+                for (size_t i = 0; i < MAX_STATES; ++i) {
+                    next[items[i].first] = items[i].second;
                 }
             }
 
