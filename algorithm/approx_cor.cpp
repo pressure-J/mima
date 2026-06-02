@@ -1,830 +1,698 @@
-/**
- * 方式2: 主导路线枚举逼近算法 (Dominant Trail Enumeration)
- *
- * 赛题三: 矩阵连乘元素的逼近
- * 第十一届(2026年)全国高校密码数学挑战赛
- *
- * 算法思路:
- *   利用线性密码分析中"相关矩阵可分解为线性路线之和"的性质，
- *   通过分支定界法枚举主导路线(相关度较大的路线)，
- *   用这些路线的相关度之和逼近真实相关度。
- *
- * 复杂度: O(B^r) 其中 B 是每轮平均分支数，远小于方式1的 O(2^32)
- */
-
-#include <iostream>
-#include <iomanip>
-#include <vector>
-#include <cstdint>
-#include <string>
-#include <cmath>
 #include <algorithm>
-#include <map>
-#include <queue>
-#include <cassert>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <filesystem>
 #include <fstream>
-#include <chrono>
-#include <unordered_map>
 #include <functional>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 using namespace std;
 
-// ============================================================
-// 基本类型和常量
-// ============================================================
-typedef unsigned int uint;
-typedef uint64_t ull;
+using u32 = uint32_t;
+using u64 = uint64_t;
 
-// S盒 (与参考代码一致)
-const int Sbox[16] = {0xC, 0x6, 0x9, 0x0, 0x1, 0xA, 0x2, 0xB, 0x3, 0x8, 0x5, 0xD, 0x4, 0xE, 0x7, 0xF};
+namespace {
 
-// ============================================================
-// 基本操作
-// ============================================================
+constexpr array<int, 16> SBOX = {
+    0xC, 0x6, 0x9, 0x0, 0x1, 0xA, 0x2, 0xB,
+    0x3, 0x8, 0x5, 0xD, 0x4, 0xE, 0x7, 0xF,
+};
 
-// F_2上的点积(奇偶性)
-inline int dot(uint u, uint y) {
-    uint z = u & y;
-    z ^= z >> 1;
-    z ^= z >> 2;
-    z ^= z >> 4;
-    z ^= z >> 8;
-    z ^= z >> 16;
-    return z & 1;
-}
+struct Transition {
+    u32 mask;
+    double corr;
+};
 
-// 4-bit nibble点积
-inline int nibble_dot(int a, int b) {
-    int z = a & b;
-    z ^= z >> 1;
-    z ^= z >> 2;
-    return z & 1;
-}
+struct Entry {
+    int rounds;
+    u32 u;
+    u32 v;
+    double ve;
+    double vt;
+    double score;
+};
 
-// ============================================================
-// S盒线性逼近表 (LAT)
-// LAT[a][b] = #{x: a·x = b·S(x)} - 8, 范围 [-8, 8]
-// 归一化相关度: lat_norm[a][b] = LAT[a][b] / 16, 范围 [-0.5, 0.5]
-// ============================================================
 int LAT[16][16];
-double LAT_norm[16][16];
+double LAT_NORM[16][16];
+vector<pair<int, double>> NONZERO_LAT[16];
+unordered_map<u32, vector<Transition>> ONE_ROUND_CACHE;
 
-void compute_LAT() {
+inline int active_nibbles(u32 x) {
+    int count = 0;
+    for (int i = 0; i < 8; ++i) {
+        count += ((x >> (4 * i)) & 0xFU) != 0U;
+    }
+    return count;
+}
+
+inline int parity32(u32 x) {
+    x ^= x >> 16;
+    x ^= x >> 8;
+    x ^= x >> 4;
+    x ^= x >> 2;
+    x ^= x >> 1;
+    return static_cast<int>(x & 1U);
+}
+
+inline array<int, 8> split_nibbles(u32 x) {
+    array<int, 8> out{};
+    for (int i = 0; i < 8; ++i) {
+        out[i] = static_cast<int>((x >> (28 - 4 * i)) & 0xFU);
+    }
+    return out;
+}
+
+inline u32 pack_nibbles(const array<int, 8>& xs) {
+    u32 out = 0;
+    for (int i = 0; i < 8; ++i) {
+        out |= static_cast<u32>(xs[i]) << (28 - 4 * i);
+    }
+    return out;
+}
+
+inline array<int, 8> linear_mask_forward(const array<int, 8>& c) {
+    return {
+        c[7],
+        c[0] ^ c[2] ^ c[5],
+        c[5],
+        c[2] ^ c[5] ^ c[7],
+        c[3],
+        c[1] ^ c[4] ^ c[6],
+        c[1],
+        c[1] ^ c[3] ^ c[6],
+    };
+}
+
+void compute_lat() {
     for (int a = 0; a < 16; ++a) {
+        NONZERO_LAT[a].clear();
         for (int b = 0; b < 16; ++b) {
             int count = 0;
             for (int x = 0; x < 16; ++x) {
-                if (nibble_dot(a, x) == nibble_dot(b, Sbox[x]))
-                    count++;
+                const int lhs = parity32(static_cast<u32>(a & x));
+                const int rhs = parity32(static_cast<u32>(b & SBOX[x]));
+                if (lhs == rhs) {
+                    ++count;
+                }
             }
             LAT[a][b] = count - 8;
-            LAT_norm[a][b] = (double)LAT[a][b] / 8.0;  // corr = (2*count-16)/16 = 2*LAT/16 = LAT/8
-        }
-    }
-}
-
-// ============================================================
-// 线性层掩码传播
-// ============================================================
-
-/**
- * 线性层: L = MC ∘ SR
- *
- * SR (行移位):
- *   (y0,y1,y2,y3,y4,y5,y6,y7) = (x0,x5,x2,x7,x4,x1,x6,x3)
- *
- * MC (列混合):
- *   y0 = x0⊕x2⊕x3,  y1 = x0
- *   y2 = x1⊕x2,      y3 = x0⊕x2
- *   y4 = x4⊕x6⊕x7,  y5 = x4
- *   y6 = x5⊕x6,      y7 = x4⊕x6
- *
- * 反向掩码传播: c = L^T(b) = SR^T(MC^T(b))
- *   给定输出掩码 b，计算S盒输出处的掩码 c
- *   c = [b0⊕b1⊕b3, b6, b0⊕b2⊕b3, b4, b4⊕b5⊕b7, b2, b4⊕b6⊕b7, b0]
- *
- * 正向掩码传播: 给定S盒输出掩码 c，计算下一轮输入掩码 b
- *   b = (MC^{-T} ∘ SR^{-T})(c)
- */
-
-// 反向传播: b → c (给定轮输出掩码b, 得到S盒输出掩码c)
-void mask_backward(const int b[8], int c[8]) {
-    c[0] = b[0] ^ b[1] ^ b[3];    // b0⊕b1⊕b3
-    c[1] = b[6];                    // b6
-    c[2] = b[0] ^ b[2] ^ b[3];    // b0⊕b2⊕b3
-    c[3] = b[4];                    // b4
-    c[4] = b[4] ^ b[5] ^ b[7];    // b4⊕b5⊕b7
-    c[5] = b[2];                    // b2
-    c[6] = b[4] ^ b[6] ^ b[7];    // b4⊕b6⊕b7
-    c[7] = b[0];                    // b0
-}
-
-// 正向传播: c → b (给定S盒输出掩码c, 得到下一轮输入掩码b)
-// b = (MC^{-T} ∘ SR^{-T})(c)
-// 推导结果: b = [c7, c0⊕c2⊕c5, c5, c2⊕c5⊕c7, c3, c1⊕c4⊕c6, c1, c1⊕c3⊕c6]
-void mask_forward(const int c[8], int b[8]) {
-    b[0] = c[7];
-    b[1] = c[0] ^ c[2] ^ c[5];
-    b[2] = c[5];
-    b[3] = c[2] ^ c[5] ^ c[7];
-    b[4] = c[3];
-    b[5] = c[1] ^ c[4] ^ c[6];
-    b[6] = c[1];
-    b[7] = c[1] ^ c[3] ^ c[6];
-}
-
-// uint ↔ nibble array 转换
-void uint_to_nibbles(uint x, int nib[8]) {
-    for (int i = 0; i < 8; ++i)
-        nib[i] = (x >> (28 - 4*i)) & 0xF;
-}
-
-uint nibbles_to_uint(const int nib[8]) {
-    uint res = 0;
-    for (int i = 0; i < 8; ++i)
-        res |= ((uint)nib[i]) << (28 - 4*i);
-    return res;
-}
-
-// ============================================================
-// 单轮相关度计算
-// c_R(a, b) = Π_{j=0}^{7} lat_norm[a_j][c_j]  where c = L^T(b)
-// ============================================================
-double single_round_corr(uint a, uint b) {
-    int na[8], nb[8], nc[8];
-    uint_to_nibbles(a, na);
-    uint_to_nibbles(b, nb);
-    mask_backward(nb, nc);
-
-    double corr = 1.0;
-    for (int j = 0; j < 8; ++j) {
-        corr *= LAT_norm[na[j]][nc[j]];
-    }
-    return corr;
-}
-
-// 计算单轮相关度并返回S盒输出掩码
-double single_round_corr_with_c(uint a, uint b, int c_out[8]) {
-    int na[8], nb[8];
-    uint_to_nibbles(a, na);
-    uint_to_nibbles(b, nb);
-    mask_backward(nb, c_out);
-
-    double corr = 1.0;
-    for (int j = 0; j < 8; ++j) {
-        corr *= LAT_norm[na[j]][c_out[j]];
-    }
-    return corr;
-}
-
-// ============================================================
-// 方式1: 精确计算 (参考实现, O(2^32))
-// ============================================================
-
-// HS(r) 置换
-uint perm(uint x, int R) {
-    int state[8];
-    uint_to_nibbles(x, state);
-
-    for (int r = 0; r < R; ++r) {
-        // SC: S盒层
-        for (int i = 0; i < 8; ++i)
-            state[i] = Sbox[state[i]];
-
-        // SR: 行移位
-        int t0 = state[0], t1 = state[5], t2 = state[2], t3 = state[7];
-        int t4 = state[4], t5 = state[1], t6 = state[6], t7 = state[3];
-
-        // MC: 列混合
-        state[0] = t0 ^ t2 ^ t3;
-        state[1] = t0;
-        state[2] = t1 ^ t2;
-        state[3] = t0 ^ t2;
-        state[4] = t4 ^ t6 ^ t7;
-        state[5] = t4;
-        state[6] = t5 ^ t6;
-        state[7] = t4 ^ t6;
-    }
-
-    return nibbles_to_uint(state);
-}
-
-// 精确计算相关度 (方式1)
-double computeCor_exact(uint u, uint v, int R) {
-    long long count = 0;
-    const uint64_t total = 1ULL << 32;
-
-    for (uint64_t x = 0; x < total; ++x) {
-        uint y = perm((uint)x, R);
-        if (dot(u, (uint)x) == dot(v, y))
-            count++;
-        else
-            count--;
-    }
-
-    return (double)count / (double)total;
-}
-
-// ============================================================
-// 方式2: 主导路线枚举逼近算法
-// ============================================================
-
-/**
- * 路线结构: 存储一条r轮路线
- *   masks[0..r]: 每轮后的掩码 (masks[0] = u, masks[r] = v)
- *   corr: 路线的相关度 (每轮相关度之积)
- */
-struct Trail {
-    vector<uint> masks;  // masks[0]=u, masks[1], ..., masks[r]=v
-    double corr;         // 路线相关度
-};
-
-// 用于分支定界的节点
-struct SearchNode {
-    vector<uint> masks;  // 已确定的掩码
-    double corr_so_far;  // 累积相关度
-    int depth;           // 已完成轮数
-    double upper_bound;  // 上界 (用于优先级队列)
-
-    bool operator<(const SearchNode& other) const {
-        return abs(upper_bound) < abs(other.upper_bound);  // 按上界绝对值降序
-    }
-};
-
-/**
- * 为了高效计算上界, 预计算每轮可能的"最佳相关度乘积"
- *
- * 思路: 对每个可能的非零S盒输入掩码, 记录最大的 |LAT_entry|
- * 上界 = |corr_so_far| × Π remaining_rounds (max_round_corr_factor)
- */
-
-// 每个轮次的最大相关度扩大因子
-// max_per_sbox[a]: 对输入掩码a, 输出掩码的最大|LAT_norm[a][b]|
-double max_per_sbox[16];
-
-void precompute_max_factors() {
-    for (int a = 0; a < 16; ++a) {
-        double mx = 0.0;
-        for (int b = 0; b < 16; ++b) {
-            mx = max(mx, abs(LAT_norm[a][b]));
-        }
-        max_per_sbox[a] = mx;
-    }
-}
-
-// 估算从当前掩码出发，剩余轮数的最大可能相关度上界
-double estimate_upper_bound(const int na[8], int remaining_rounds) {
-    double ub = 1.0;
-    for (int j = 0; j < 8; ++j) {
-        if (na[j] != 0) {
-            ub *= max_per_sbox[na[j]];
-        }
-        // 如果 na[j]==0, 则只有输出也为0时才有非零相关度,
-        // lat_norm[0][0]=1, 但考虑到线性层可能改变, 保守估计为1
-    }
-    return pow(ub, remaining_rounds);
-}
-
-/**
- * 枚举从输入掩码a出发，一轮后所有可能的输出掩码b及其相关度
- * 只返回 |corr| >= threshold 的结果
- */
-void enumerate_one_round(uint a, double threshold,
-                         vector<pair<uint, double>>& results) {
-    int na[8];
-    uint_to_nibbles(a, na);
-
-    // 收集每个S盒可能的输出掩码
-    vector<vector<int>> possible_c(8);
-    for (int j = 0; j < 8; ++j) {
-        if (na[j] == 0) {
-            // 输入掩码为0时, 只有输出也为0才非零
-            possible_c[j].push_back(0);
-        } else {
-            // 输入掩码非零时, 所有16个输出都可能, 但很多相关度很小
-            for (int cj = 0; cj < 16; ++cj) {
-                if (abs(LAT_norm[na[j]][cj]) > 0.0)
-                    possible_c[j].push_back(cj);
+            LAT_NORM[a][b] = static_cast<double>(LAT[a][b]) / 8.0;
+            if (LAT[a][b] != 0) {
+                NONZERO_LAT[a].push_back({b, LAT_NORM[a][b]});
             }
         }
     }
+}
 
-    // 递归枚举所有组合 (带计数限制防爆栈)
-    int c_cur[8], b_out[8];
-    int max_enumerations = 1000000;  // 最大枚举数，防指数爆炸
-    int enum_count = 0;
+vector<Transition> build_one_round(u32 input_mask) {
+    const array<int, 8> in = split_nibbles(input_mask);
+    array<int, 8> sbox_out{};
+    unordered_map<u32, double> merged;
 
-    function<void(int, double)> dfs =
-        [&](int pos, double corr_prod) {
-        if (enum_count >= max_enumerations) return;
-
-        // 基于上界的剪枝
-        if (abs(corr_prod) > 0 && pos > 0) {
-            double max_remain = 1.0;
-            for (int k = pos; k < 8; ++k)
-                max_remain *= max_per_sbox[na[k]];
-            if (abs(corr_prod) * max_remain < threshold)
-                return;
-        }
-
+    function<void(int, double)> dfs = [&](int pos, double corr) {
         if (pos == 8) {
-            enum_count++;
-            if (abs(corr_prod) >= threshold) {
-                mask_forward(c_cur, b_out);
-                uint b = nibbles_to_uint(b_out);
-                results.push_back({b, corr_prod});
+            const u32 next_mask = pack_nibbles(linear_mask_forward(sbox_out));
+            if (next_mask != 0U) {
+                merged[next_mask] += corr;
             }
             return;
         }
 
-        // 按LAT绝对值降序遍历，先访问高相关度分支
-        vector<pair<int, double>> sorted_candidates;
-        for (int cj : possible_c[pos])
-            sorted_candidates.push_back({cj, abs(LAT_norm[na[pos]][cj])});
-        sort(sorted_candidates.begin(), sorted_candidates.end(),
-             [](auto& p1, auto& p2) { return p1.second > p2.second; });
+        const int nib = in[pos];
+        if (nib == 0) {
+            sbox_out[pos] = 0;
+            dfs(pos + 1, corr);
+            return;
+        }
 
-        for (auto& [cj, _] : sorted_candidates) {
-            c_cur[pos] = cj;
-            dfs(pos + 1, corr_prod * LAT_norm[na[pos]][cj]);
+        for (const auto& [out_mask, sbox_corr] : NONZERO_LAT[nib]) {
+            sbox_out[pos] = out_mask;
+            dfs(pos + 1, corr * sbox_corr);
         }
     };
 
     dfs(0, 1.0);
+
+    vector<Transition> transitions;
+    transitions.reserve(merged.size());
+    for (const auto& [mask, corr] : merged) {
+        if (fabs(corr) > 1e-18) {
+            transitions.push_back({mask, corr});
+        }
+    }
+    sort(transitions.begin(), transitions.end(), [](const Transition& a, const Transition& b) {
+        if (fabs(a.corr) != fabs(b.corr)) {
+            return fabs(a.corr) > fabs(b.corr);
+        }
+        return a.mask < b.mask;
+    });
+    return transitions;
 }
 
-/**
- * 方式2主体: 主导路线枚举 + 分支定界
- *
- * @param u: 输入掩码
- * @param v: 输出掩码
- * @param r: 轮数
- * @param threshold: 路线相关度阈值 (低于此值的路线被剪枝)
- * @return: 估计的相关度 VE
- */
-double approx_cor_trail(uint u, uint v, int r, double threshold = 1e-10) {
-    if (r == 0) {
-        return (u == v) ? 1.0 : 0.0;
+const vector<Transition>& enumerate_one_round(u32 input_mask) {
+    auto cached = ONE_ROUND_CACHE.find(input_mask);
+    if (cached != ONE_ROUND_CACHE.end()) {
+        return cached->second;
     }
 
-    // 对于r=1, 直接计算
-    if (r == 1) {
-        return single_round_corr(u, v);
-    }
-
-    // 双向搜索: 从u向前, 从v向后, 在中间汇合
-    // 对于一般情况, 使用单向分支定界搜索
-
-    // 预计算各轮可能的中间掩码
-    // 使用队列进行BFS搜索
-
-    // 存储到达每轮各掩码的累积相关度
-    // cur_layer[mask] = 累积相关度
-    unordered_map<uint, double> cur_layer;
-    cur_layer[u] = 1.0;
-
-    for (int round = 0; round < r; ++round) {
-        unordered_map<uint, double> next_layer;
-
-        double round_threshold = threshold / pow(16.0, (double)(r - round - 1));
-        // 动态调整阈值: 越接近终点, 越放宽
-
-        for (auto& [mask, corr] : cur_layer) {
-            vector<pair<uint, double>> next_masks;
-            enumerate_one_round(mask, round_threshold / max(1.0, abs(corr)), next_masks);
-
-            for (auto& [next_mask, trans_corr] : next_masks) {
-                double new_corr = corr * trans_corr;
-                next_layer[next_mask] += new_corr;
-            }
-        }
-
-        cur_layer = move(next_layer);
-
-        // 剪枝: 保留 top-K 条目
-        if (cur_layer.size() > 100000) {
-            vector<pair<double, uint>> sorted;
-            for (auto& [mask, corr] : cur_layer) {
-                sorted.push_back({abs(corr), mask});
-            }
-            sort(sorted.rbegin(), sorted.rend());
-
-            unordered_map<uint, double> pruned;
-            for (size_t i = 0; i < min((size_t)50000, sorted.size()); ++i) {
-                pruned[sorted[i].second] = cur_layer[sorted[i].second];
-            }
-            cur_layer = move(pruned);
-        }
-    }
-
-    auto it = cur_layer.find(v);
-    if (it != cur_layer.end())
-        return it->second;
-    return 0.0;
+    return ONE_ROUND_CACHE.emplace(input_mask, build_one_round(input_mask)).first->second;
 }
 
-/**
- * 方式2增强版: 使用优先队列进行启发式搜索
- * 确保找到主导路线, 同时尽早剪枝
- */
-double approx_cor_enhanced(uint u, uint v, int r, int top_k = 100, double min_corr = 1e-8) {
-    if (r == 0) return (u == v) ? 1.0 : 0.0;
-    if (r == 1) return single_round_corr(u, v);
+unordered_map<u32, double> exact_distribution(u32 u, int rounds) {
+    unordered_map<u32, double> current;
+    current.reserve(1024);
+    current[u] = 1.0;
 
-    // 使用优先队列按相关度绝对值排序
-    priority_queue<SearchNode> pq;
+    for (int r = 0; r < rounds; ++r) {
+        unordered_map<u32, double> next;
+        next.reserve(current.size() * 8);
 
-    SearchNode root;
-    root.masks.push_back(u);
-    root.corr_so_far = 1.0;
-    root.depth = 0;
-
-    int na_root[8];
-    uint_to_nibbles(u, na_root);
-    root.upper_bound = estimate_upper_bound(na_root, r);
-    pq.push(root);
-
-    double result = 0.0;
-    int trails_found = 0;
-
-    while (!pq.empty() && trails_found < top_k * 10) {
-        SearchNode node = pq.top();
-        pq.pop();
-
-        // 如果上界已经小于阈值, 跳过
-        if (abs(node.upper_bound) < min_corr) continue;
-
-        if (node.depth == r) {
-            // 到达终点
-            uint final_mask = node.masks.back();
-            if (final_mask == v) {
-                result += node.corr_so_far;
-                trails_found++;
-            }
-            continue;
-        }
-
-        // 枚举下一轮
-        uint cur_mask = node.masks.back();
-        vector<pair<uint, double>> next_masks;
-
-        double local_threshold = min_corr / max(1.0, abs(node.corr_so_far));
-        enumerate_one_round(cur_mask, local_threshold, next_masks);
-
-        for (auto& [next_mask, trans_corr] : next_masks) {
-            double new_corr = node.corr_so_far * trans_corr;
-
-            int na[8];
-            uint_to_nibbles(next_mask, na);
-            double ub = abs(new_corr) * estimate_upper_bound(na, r - node.depth - 1);
-
-            if (ub >= min_corr) {
-                SearchNode child;
-                child.masks = node.masks;
-                child.masks.push_back(next_mask);
-                child.corr_so_far = new_corr;
-                child.depth = node.depth + 1;
-                child.upper_bound = ub;
-                pq.push(child);
+        for (const auto& [mask, corr] : current) {
+            if (active_nibbles(mask) <= 2) {
+                const auto& transitions = enumerate_one_round(mask);
+                for (const auto& transition : transitions) {
+                    next[transition.mask] += corr * transition.corr;
+                }
+            } else {
+                const auto transitions = build_one_round(mask);
+                for (const auto& transition : transitions) {
+                    next[transition.mask] += corr * transition.corr;
+                }
             }
         }
+
+        for (auto it = next.begin(); it != next.end();) {
+            if (fabs(it->second) <= 1e-18) {
+                it = next.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        current = move(next);
     }
 
-    return result;
+    return current;
 }
 
-/**
- * 方式2最终版: 稀疏矩阵迭代法
- * 对每一轮, 维护输入掩码到相关度的稀疏映射
- * 利用阈值的动态调整来控制复杂度
- */
-double approx_cor_sparse(uint u, uint v, int r, int beam_width = 50000) {
-    if (r == 0) return (u == v) ? 1.0 : 0.0;
-    if (r == 1) return single_round_corr(u, v);
+double exact_value(u32 u, u32 v, int rounds) {
+    if (rounds == 0) {
+        return u == v ? 1.0 : 0.0;
+    }
+    const auto distribution = exact_distribution(u, rounds);
+    auto it = distribution.find(v);
+    return it == distribution.end() ? 0.0 : it->second;
+}
 
-    // cur[mask] = 累积相关度
-    unordered_map<uint, double> cur;
-    cur[u] = 1.0;
+void round_function(array<int, 8>& state) {
+    for (int i = 0; i < 8; ++i) {
+        state[i] = SBOX[state[i]];
+    }
 
-    for (int round = 0; round < r; ++round) {
-        unordered_map<uint, double> nxt;
+    const int t0 = state[0];
+    const int t1 = state[5];
+    const int t2 = state[2];
+    const int t3 = state[7];
+    const int t4 = state[4];
+    const int t5 = state[1];
+    const int t6 = state[6];
+    const int t7 = state[3];
 
-        // 动态阈值: 根据当前轮数和条目数调整
-        double dyn_threshold = 1e-12;
-        if (cur.size() > 1000) {
-            // 找出中位数相关度作为参考
-            vector<double> abs_corrs;
-            for (auto& [m, c] : cur) abs_corrs.push_back(abs(c));
-            sort(abs_corrs.begin(), abs_corrs.end());
-            if ((int)abs_corrs.size() > beam_width) {
-                dyn_threshold = abs_corrs[abs_corrs.size() - beam_width];
-            }
+    state[0] = t0 ^ t2 ^ t3;
+    state[1] = t0;
+    state[2] = t1 ^ t2;
+    state[3] = t0 ^ t2;
+    state[4] = t4 ^ t6 ^ t7;
+    state[5] = t4;
+    state[6] = t5 ^ t6;
+    state[7] = t4 ^ t6;
+}
+
+u32 permute(u32 x, int rounds) {
+    auto state = split_nibbles(x);
+    for (int r = 0; r < rounds; ++r) {
+        round_function(state);
+    }
+    return pack_nibbles(state);
+}
+
+double brute_force_value(u32 u, u32 v, int rounds) {
+    long long count = 0;
+    constexpr u64 total = 1ULL << 32;
+    for (u64 x = 0; x < total; ++x) {
+        const u32 y = permute(static_cast<u32>(x), rounds);
+        count += (parity32(u & static_cast<u32>(x)) == parity32(v & y)) ? 1 : -1;
+    }
+    return static_cast<double>(count) / static_cast<double>(total);
+}
+
+double compute_score(double ve, int rounds) {
+    return log2(pow(4.0, rounds) * fabs(ve));
+}
+
+vector<u32> single_active_inputs() {
+    vector<u32> masks;
+    masks.reserve(8 * 15);
+    for (int pos = 0; pos < 8; ++pos) {
+        for (int nib = 1; nib < 16; ++nib) {
+            array<int, 8> xs{};
+            xs[pos] = nib;
+            masks.push_back(pack_nibbles(xs));
         }
+    }
+    return masks;
+}
 
-        int count = 0;
-        for (auto& [mask, corr] : cur) {
-            if (abs(corr) < dyn_threshold && count > beam_width) continue;
-            count++;
+vector<Entry> search_positive_score_entries(int max_rounds) {
+    const auto inputs = single_active_inputs();
+    vector<Entry> entries;
 
-            vector<pair<uint, double>> next_vec;
-            // 动态限制每掩码枚举数，避免单轮组合爆炸
-            double effective_threshold = dyn_threshold / max(1.0, abs(corr));
-            effective_threshold = max(effective_threshold, 1e-10);
-            enumerate_one_round(mask, effective_threshold, next_vec);
+    for (u32 u : inputs) {
+        ONE_ROUND_CACHE.clear();
+        unordered_map<u32, double> current;
+        current.reserve(1024);
+        current[u] = 1.0;
 
-            for (auto& [nm, tc] : next_vec) {
-                nxt[nm] += corr * tc;
+        for (int rounds = 1; rounds <= max_rounds; ++rounds) {
+            unordered_map<u32, double> next;
+            next.reserve(current.size() * 8);
+            for (const auto& [mask, corr] : current) {
+                if (active_nibbles(mask) <= 2) {
+                    const auto& transitions = enumerate_one_round(mask);
+                    for (const auto& transition : transitions) {
+                        next[transition.mask] += corr * transition.corr;
+                    }
+                } else {
+                    const auto transitions = build_one_round(mask);
+                    for (const auto& transition : transitions) {
+                        next[transition.mask] += corr * transition.corr;
+                    }
+                }
             }
-        }
 
-        cur = move(nxt);
+            for (auto it = next.begin(); it != next.end();) {
+                if (fabs(it->second) <= 1e-18) {
+                    it = next.erase(it);
+                } else {
+                    ++it;
+                }
+            }
 
-        // Beam pruning
-        if (cur.size() > (size_t)beam_width) {
-            vector<pair<double, uint>> scored;
-            for (auto& [m, c] : cur)
-                scored.push_back({abs(c), m});
-            sort(scored.rbegin(), scored.rend());
-
-            unordered_map<uint, double> pruned;
-            for (int i = 0; i < beam_width; ++i)
-                pruned[scored[i].second] = cur[scored[i].second];
-            cur = move(pruned);
+            const double min_abs = 1.0 / pow(4.0, rounds);
+            for (const auto& [v, corr] : next) {
+                if (u == 0U || v == 0U) {
+                    continue;
+                }
+                if (fabs(corr) <= min_abs) {
+                    continue;
+                }
+                entries.push_back({rounds, u, v, corr, corr, compute_score(corr, rounds)});
+            }
+            current = move(next);
         }
     }
 
-    auto it = cur.find(v);
-    return (it != cur.end()) ? it->second : 0.0;
+    sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+        if (a.rounds != b.rounds) {
+            return a.rounds < b.rounds;
+        }
+        if (a.score != b.score) {
+            return a.score > b.score;
+        }
+        if (a.u != b.u) {
+            return a.u < b.u;
+        }
+        return a.v < b.v;
+    });
+    return entries;
 }
 
-// ============================================================
-// 验证与评估
-// ============================================================
-
-struct EvalResult {
-    uint u, v;
-    int r;
-    double vt;   // 真实值
-    double ve;   // 估计值
-    double abs_err;
-    double rel_bound;  // 允许的相对误差上界 = |VT| × 2^(-2r)
-    bool valid;  // 是否满足有效条件
-    double score; // 单条得分
-};
-
-// 检查是否为有效估计值
-bool check_valid(double ve, double vt, uint u, uint v, int r) {
-    if (ve == 0.0) return false;
-    if (u == 0) return false;
-    if (v == 0) return false;
-    double bound = abs(vt) * pow(2.0, -2.0 * r);
-    return abs(ve - vt) <= bound;
+filesystem::path results_dir() {
+    return filesystem::current_path().parent_path() / "results";
 }
 
-// 计算单条得分
-double compute_score(double ve, int r) {
-    if (ve == 0.0) return -1e9;
-    return log2(pow(2.0, 2.0 * r) * abs(ve));
+void write_estimates(const vector<Entry>& entries) {
+    const auto dir = results_dir();
+    filesystem::create_directories(dir);
+
+    ofstream txt(dir / "valid_estimates.txt");
+    ofstream report(dir / "score_report.txt");
+    ofstream summary(dir / "scores.txt");
+
+    txt << "# Valid estimates generated by the repaired exact sparse-composition solver\n";
+    txt << "# Format required by the problem statement: @(r, u, v, VE, VT)\n";
+
+    report << fixed << setprecision(12);
+    report << "PDF-compliant scoring report\n";
+    report << "Rule: valid iff VE in [VT-|VT|*2^(-2r), VT+|VT|*2^(-2r)], VE!=0, u!=0, v!=0\n";
+    report << "This solver computes VE and VT by exact sparse correlation composition, so VE = VT.\n\n";
+
+    summary << fixed << setprecision(4);
+
+    double total_score = 0.0;
+    int current_round = -1;
+    vector<double> round_scores;
+
+    auto flush_round = [&](int rounds) {
+        if (round_scores.empty()) {
+            return;
+        }
+        const double round_sum = accumulate(round_scores.begin(), round_scores.end(), 0.0);
+        const double round_avg = round_sum / static_cast<double>(round_scores.size());
+        const double round_max = *max_element(round_scores.begin(), round_scores.end());
+        const double round_min = *min_element(round_scores.begin(), round_scores.end());
+        report << "r=" << rounds
+               << ": count=" << round_scores.size()
+               << ", sum=" << round_sum
+               << ", max=" << round_max
+               << ", min=" << round_min
+               << ", avg=" << round_avg << "\n\n";
+        summary << "r=" << rounds
+                << ": count=" << round_scores.size()
+                << ", sum=" << round_sum
+                << ", max=" << round_max
+                << ", min=" << round_min
+                << ", avg=" << round_avg << "\n";
+        round_scores.clear();
+    };
+
+    for (const auto& entry : entries) {
+        if (entry.rounds != current_round) {
+            flush_round(current_round);
+            current_round = entry.rounds;
+            report << "=== r = " << current_round << " ===\n";
+            report << "No  u           v           VE                 VT                 Score\n";
+        }
+
+        txt << "@(" << entry.rounds
+            << ", 0x" << hex << setw(8) << setfill('0') << uppercase << entry.u
+            << ", 0x" << setw(8) << entry.v
+            << dec << nouppercase << setfill(' ')
+            << ", " << setprecision(15) << entry.ve
+            << ", " << setprecision(15) << entry.vt
+            << ")\n";
+
+        report << setw(2) << round_scores.size() + 1
+               << "  0x" << hex << setw(8) << setfill('0') << uppercase << entry.u
+               << "  0x" << setw(8) << entry.v
+               << dec << nouppercase << setfill(' ')
+               << "  " << setw(18) << setprecision(12) << entry.ve
+               << "  " << setw(18) << setprecision(12) << entry.vt
+               << "  " << setw(8) << setprecision(4) << entry.score << "\n";
+
+        total_score += entry.score;
+        round_scores.push_back(entry.score);
+    }
+
+    flush_round(current_round);
+    summary << "\nTotal valid estimates: " << entries.size() << "\n";
+    summary << "Total score: " << total_score << "\n";
+    report << "Total valid estimates: " << entries.size() << "\n";
+    report << "Total score: " << total_score << "\n";
+
+    cout << "Wrote " << entries.size() << " entries to " << (dir / "valid_estimates.txt").string() << "\n";
+    cout << "Total score: " << fixed << setprecision(4) << total_score << "\n";
 }
 
-// ============================================================
-// 主程序
-// ============================================================
+string to_hex(u32 value) {
+    stringstream ss;
+    ss << "0x" << hex << setw(8) << setfill('0') << uppercase << value;
+    return ss.str();
+}
 
 void print_usage() {
-    cout << "使用方法:" << endl;
-    cout << "  approx_cor.exe <mode> [参数]" << endl;
-    cout << endl;
-    cout << "模式:" << endl;
-    cout << "  1 u v r  -- 精确计算 (方式1, O(2^32))" << endl;
-    cout << "  2 u v r  -- 稀疏矩阵迭代逼近 (方式2)" << endl;
-    cout << "  3 u v r  -- 主导路线枚举逼近 (方式2增强版)" << endl;
-    cout << "  batch r n  -- 批量测试: r轮, 随机n组(u,v)" << endl;
-    cout << "  eval r file  -- 从文件读取(u,v)对进行评估" << endl;
-    cout << "  lat  -- 打印S盒LAT表" << endl;
-    cout << endl;
-    cout << "例: approx_cor.exe 2 0x000ee0f0 0x08088880 2" << endl;
+    cout << "Usage:\n";
+    cout << "  approx_cor exact <u> <v> <r>\n";
+    cout << "  approx_cor brute <u> <v> <r>\n";
+    cout << "  approx_cor dump <u> <r>\n";
+    cout << "  approx_cor dump-single-active <r> [output_path]\n";
+    cout << "  approx_cor dump-single-active-pos <r> <pos> [output_path]\n";
+    cout << "  approx_cor dump-single-active-mask <r> <pos> <nib> [output_path]\n";
+    cout << "  approx_cor search <max_rounds>\n";
+    cout << "\n";
+    cout << "Notes:\n";
+    cout << "  exact : exact sparse correlation composition (PDF-compliant, fast)\n";
+    cout << "  brute : 2^32 plaintext enumeration reference\n";
+    cout << "  dump  : dump all positive-score exact entries for one input mask\n";
+    cout << "  dump-single-active : dump all positive-score exact entries for all single-active inputs\n";
+    cout << "  dump-single-active-pos : dump all positive-score exact entries for one active position\n";
+    cout << "  dump-single-active-mask : dump all positive-score exact entries for one active position and nibble\n";
+    cout << "  search: enumerate all positive-score entries for single-active input masks\n";
 }
 
+}  // namespace
+
 int main(int argc, char* argv[]) {
-    // 预计算
-    compute_LAT();
-    precompute_max_factors();
+    compute_lat();
 
     if (argc < 2) {
         print_usage();
         return 0;
     }
 
-    string mode = argv[1];
+    const string mode = argv[1];
 
-    if (mode == "lat") {
-        cout << "=== S盒线性逼近表 (LAT) ===" << endl;
-        cout << "     ";
-        for (int b = 0; b < 16; ++b)
-            cout << setw(4) << hex << b;
-        cout << dec << endl;
-        for (int a = 0; a < 16; ++a) {
-            cout << setw(2) << hex << a << ": ";
-            for (int b = 0; b < 16; ++b) {
-                cout << setw(4) << LAT[a][b];
-            }
-            cout << endl;
-        }
-        cout << dec << endl;
-        return 0;
-    }
-
-    if (mode == "1" && argc >= 5) {
-        uint u = stoul(argv[2], nullptr, 16);
-        uint v = stoul(argv[3], nullptr, 16);
-        int r = atoi(argv[4]);
-
-        cout << "=== 方式1: 精确计算 ===" << endl;
-        cout << "r=" << r << " u=0x" << hex << setw(8) << setfill('0') << u;
-        cout << " v=0x" << setw(8) << setfill('0') << v << dec << endl;
-
-        auto start = chrono::high_resolution_clock::now();
-        double vt = computeCor_exact(u, v, r);
-        auto end = chrono::high_resolution_clock::now();
-
-        auto duration = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-
-        cout << "真实相关度 VT = " << setprecision(12) << vt << endl;
-        cout << "log2(|VT|) = " << log2(abs(vt)) << endl;
-        cout << "计算时间: " << duration << " ms" << endl;
-        return 0;
-    }
-
-    if (mode == "2" && argc >= 5) {
-        uint u = stoul(argv[2], nullptr, 16);
-        uint v = stoul(argv[3], nullptr, 16);
-        int r = atoi(argv[4]);
-
-        cout << "=== 方式2: 稀疏矩阵迭代逼近 ===" << endl;
-        cout << "r=" << r << " u=0x" << hex << setw(8) << setfill('0') << u;
-        cout << " v=0x" << setw(8) << setfill('0') << v << dec << endl;
-
-        auto start = chrono::high_resolution_clock::now();
-        double ve = approx_cor_sparse(u, v, r);
-        auto end = chrono::high_resolution_clock::now();
-        auto duration = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-
-        cout << "估计相关度 VE = " << setprecision(12) << ve << endl;
-        cout << "log2(|VE|) = " << log2(abs(ve)) << endl;
-        cout << "计算时间: " << duration << " ms" << endl;
-
-        // 如果r较小, 同时计算真实值进行对比
-        if (r <= 2) {
-            cout << endl << "计算真实值进行对比..." << endl;
-            double vt = computeCor_exact(u, v, r);
-            cout << "真实值 VT = " << setprecision(12) << vt << endl;
-            cout << "误差 |VE-VT| = " << abs(ve - vt) << endl;
-            cout << "允许误差 ≤ |VT|×2^(-2r) = " << abs(vt) * pow(2.0, -2.0*r) << endl;
-            if (check_valid(ve, vt, u, v, r)) {
-                cout << "✓ 有效估计值 (满足精度要求)" << endl;
-                cout << "得分 = " << compute_score(ve, r) << endl;
-            } else {
-                cout << "✗ 无效估计值 (不满足精度要求)" << endl;
-            }
+    if (mode == "exact" && argc >= 5) {
+        const u32 u = static_cast<u32>(stoul(argv[2], nullptr, 16));
+        const u32 v = static_cast<u32>(stoul(argv[3], nullptr, 16));
+        const int rounds = stoi(argv[4]);
+        const double vt = exact_value(u, v, rounds);
+        cout << "u  = " << to_hex(u) << "\n";
+        cout << "v  = " << to_hex(v) << "\n";
+        cout << "r  = " << rounds << "\n";
+        cout << setprecision(15);
+        cout << "VT = " << vt << "\n";
+        if (vt != 0.0) {
+            cout << "score = " << compute_score(vt, rounds) << "\n";
         }
         return 0;
     }
 
-    if (mode == "3" && argc >= 5) {
-        uint u = stoul(argv[2], nullptr, 16);
-        uint v = stoul(argv[3], nullptr, 16);
-        int r = atoi(argv[4]);
-
-        cout << "=== 方式2增强版: 主导路线枚举 ===" << endl;
-        cout << "r=" << r << " u=0x" << hex << setw(8) << setfill('0') << u;
-        cout << " v=0x" << setw(8) << setfill('0') << v << dec << endl;
-
-        auto start = chrono::high_resolution_clock::now();
-        double ve = approx_cor_enhanced(u, v, r);
-        auto end = chrono::high_resolution_clock::now();
-        auto duration = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-
-        cout << "估计相关度 VE = " << setprecision(12) << ve << endl;
-        cout << "log2(|VE|) = " << log2(abs(ve)) << endl;
-        cout << "计算时间: " << duration << " ms" << endl;
+    if (mode == "brute" && argc >= 5) {
+        const u32 u = static_cast<u32>(stoul(argv[2], nullptr, 16));
+        const u32 v = static_cast<u32>(stoul(argv[3], nullptr, 16));
+        const int rounds = stoi(argv[4]);
+        const double vt = brute_force_value(u, v, rounds);
+        cout << "u  = " << to_hex(u) << "\n";
+        cout << "v  = " << to_hex(v) << "\n";
+        cout << "r  = " << rounds << "\n";
+        cout << setprecision(15);
+        cout << "VT = " << vt << "\n";
+        if (vt != 0.0) {
+            cout << "score = " << compute_score(vt, rounds) << "\n";
+        }
         return 0;
     }
 
-    if (mode == "batch" && argc >= 4) {
-        int r = atoi(argv[2]);
-        int n = atoi(argv[3]);
+    if (mode == "search" && argc >= 3) {
+        const int max_rounds = stoi(argv[2]);
+        const auto entries = search_positive_score_entries(max_rounds);
+        write_estimates(entries);
+        return 0;
+    }
 
-        cout << "=== 批量测试 r=" << r << " n=" << n << " ===" << endl;
+    if (mode == "dump" && argc >= 4) {
+        const u32 u = static_cast<u32>(stoul(argv[2], nullptr, 16));
+        const int rounds = stoi(argv[3]);
+        const double min_abs = 1.0 / pow(4.0, rounds);
+        const auto distribution = exact_distribution(u, rounds);
+        vector<Entry> entries;
+        for (const auto& [v, corr] : distribution) {
+            if (u == 0U || v == 0U) {
+                continue;
+            }
+            if (fabs(corr) <= min_abs) {
+                continue;
+            }
+            entries.push_back({rounds, u, v, corr, corr, compute_score(corr, rounds)});
+        }
+        sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+            if (a.score != b.score) {
+                return a.score > b.score;
+            }
+            return a.v < b.v;
+        });
+        cout << fixed << setprecision(15);
+        for (const auto& entry : entries) {
+            cout << "@(" << entry.rounds
+                 << ", 0x" << hex << setw(8) << setfill('0') << uppercase << entry.u
+                 << ", 0x" << setw(8) << entry.v
+                 << dec << nouppercase << setfill(' ')
+                 << ", " << entry.ve
+                 << ", " << entry.vt
+                 << ")\n";
+        }
+        return 0;
+    }
 
-        // 使用固定的测试向量 (保证可重现)
-        // 实际中应使用随机种子
-        vector<pair<uint,uint>> test_vecs;
+    if (mode == "dump-single-active" && argc >= 3) {
+        const int rounds = stoi(argv[2]);
+        ostream* out = &cout;
+        ofstream fout;
+        if (argc >= 4) {
+            fout.open(argv[3], ios::out | ios::trunc);
+            out = &fout;
+        }
 
-        // 生成具有不同活跃S盒数量的测试向量
-        // 单活跃S盒
-        for (int pos = 0; pos < 8 && test_vecs.size() < (size_t)n; ++pos) {
-            for (int mask = 1; mask < 16 && test_vecs.size() < (size_t)n; ++mask) {
-                uint u = ((uint)mask) << (28 - 4*pos);
-                for (int vmask = 1; vmask < 16 && test_vecs.size() < (size_t)n; ++vmask) {
-                    uint v = ((uint)vmask) << (28 - 4*pos);
-                    test_vecs.push_back({u, v});
+        const auto inputs = single_active_inputs();
+        bool write_header = argc >= 4;
+        if (write_header) {
+            *out << "# Valid estimates generated by exact sparse composition for all single-active inputs, r="
+                 << rounds << "\n";
+            *out << "# Format: @(r, u, v, VE, VT)\n";
+        }
+
+        size_t total = 0;
+        for (u32 u : inputs) {
+            ONE_ROUND_CACHE.clear();
+            const double min_abs = 1.0 / pow(4.0, rounds);
+            const auto distribution = exact_distribution(u, rounds);
+            vector<Entry> entries;
+            for (const auto& [v, corr] : distribution) {
+                if (u == 0U || v == 0U) {
+                    continue;
                 }
-            }
-        }
-
-        // 双活跃S盒
-        for (int p1 = 0; p1 < 8 && test_vecs.size() < (size_t)n; ++p1) {
-            for (int p2 = p1+1; p2 < 8 && test_vecs.size() < (size_t)n; ++p2) {
-                uint u = ((uint)0xF) << (28 - 4*p1) | ((uint)0xF) << (28 - 4*p2);
-                for (int vm = 1; vm < 16 && test_vecs.size() < (size_t)n; ++vm) {
-                    uint v = ((uint)vm) << (28 - 4*p1);
-                    test_vecs.push_back({u, v});
+                if (fabs(corr) <= min_abs) {
+                    continue;
                 }
+                entries.push_back({rounds, u, v, corr, corr, compute_score(corr, rounds)});
+            }
+            sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+                if (a.score != b.score) {
+                    return a.score > b.score;
+                }
+                return a.v < b.v;
+            });
+            *out << fixed << setprecision(15);
+            for (const auto& entry : entries) {
+                *out << "@(" << entry.rounds
+                     << ", 0x" << hex << setw(8) << setfill('0') << uppercase << entry.u
+                     << ", 0x" << setw(8) << entry.v
+                     << dec << nouppercase << setfill(' ')
+                     << ", " << entry.ve
+                     << ", " << entry.vt
+                     << ")\n";
+                ++total;
             }
         }
 
-        cout << "生成测试向量: " << test_vecs.size() << " 组" << endl;
-
-        vector<EvalResult> results;
-        int valid_count = 0;
-
-        for (size_t i = 0; i < test_vecs.size() && i < (size_t)n; ++i) {
-            auto [u, v] = test_vecs[i];
-
-            cout << "\r测试进度: " << (i+1) << "/" << min((size_t)n, test_vecs.size()) << flush;
-
-            double vt = computeCor_exact(u, v, r);
-            double ve = approx_cor_sparse(u, v, r);
-
-            EvalResult er;
-            er.u = u; er.v = v; er.r = r;
-            er.vt = vt; er.ve = ve;
-            er.abs_err = abs(ve - vt);
-            er.rel_bound = abs(vt) * pow(2.0, -2.0*r);
-            er.valid = check_valid(ve, vt, u, v, r);
-            er.score = er.valid ? compute_score(ve, r) : -1e9;
-
-            if (er.valid) valid_count++;
-            results.push_back(er);
+        if (argc < 4) {
+            cerr << "total_entries=" << total << "\n";
         }
-        cout << endl;
+        return 0;
+    }
 
-        // 输出结果
-        cout << endl << "=== 批量测试结果 (r=" << r << ") ===" << endl;
-        cout << "总测试数: " << results.size() << endl;
-        cout << "有效估计值: " << valid_count << " (" << 100.0*valid_count/results.size() << "%)" << endl;
-        cout << endl;
+    if (mode == "dump-single-active-pos" && argc >= 4) {
+        const int rounds = stoi(argv[2]);
+        const int pos = stoi(argv[3]);
+        if (pos < 0 || pos >= 8) {
+            cerr << "pos must be in [0,7]\n";
+            return 1;
+        }
 
-        // 输出有效估计值列表
-        cout << "有效估计值列表:" << endl;
-        cout << setw(6) << "序号" << setw(12) << "u" << setw(12) << "v";
-        cout << setw(16) << "VT" << setw(16) << "VE";
-        cout << setw(14) << "|VE-VT|" << setw(14) << "允许误差" << setw(10) << "得分" << endl;
-        cout << string(100, '-') << endl;
+        ostream* out = &cout;
+        ofstream fout;
+        if (argc >= 5) {
+            fout.open(argv[4], ios::out | ios::trunc);
+            out = &fout;
+        }
 
-        int idx = 0;
-        for (auto& er : results) {
-            if (er.valid) {
-                idx++;
-                cout << setw(4) << idx
-                     << " 0x" << hex << setw(8) << setfill('0') << er.u
-                     << " 0x" << setw(8) << setfill('0') << er.v << dec
-                     << setw(16) << setprecision(10) << er.vt
-                     << setw(16) << setprecision(10) << er.ve
-                     << setw(14) << setprecision(4) << er.abs_err
-                     << setw(14) << setprecision(4) << er.rel_bound
-                     << setw(10) << setprecision(4) << er.score
-                     << endl;
+        for (int nib = 1; nib <= 15; ++nib) {
+            const u32 u = static_cast<u32>(nib) << (28 - 4 * pos);
+            ONE_ROUND_CACHE.clear();
+            const double min_abs = 1.0 / pow(4.0, rounds);
+            const auto distribution = exact_distribution(u, rounds);
+            vector<Entry> entries;
+            for (const auto& [v, corr] : distribution) {
+                if (u == 0U || v == 0U) {
+                    continue;
+                }
+                if (fabs(corr) <= min_abs) {
+                    continue;
+                }
+                entries.push_back({rounds, u, v, corr, corr, compute_score(corr, rounds)});
+            }
+            sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+                if (a.score != b.score) {
+                    return a.score > b.score;
+                }
+                return a.v < b.v;
+            });
+            *out << fixed << setprecision(15);
+            for (const auto& entry : entries) {
+                *out << "@(" << entry.rounds
+                     << ", 0x" << hex << setw(8) << setfill('0') << uppercase << entry.u
+                     << ", 0x" << setw(8) << entry.v
+                     << dec << nouppercase << setfill(' ')
+                     << ", " << entry.ve
+                     << ", " << entry.vt
+                     << ")\n";
             }
         }
+        return 0;
+    }
 
-        // 保存到文件
-        ofstream fout("batch_results_r" + to_string(r) + ".txt");
-        fout << "=== 批量测试结果 (r=" << r << ") ===" << endl;
-        fout << "总测试数: " << results.size() << endl;
-        fout << "有效估计值: " << valid_count << endl;
-        fout << endl;
-        fout << "序号\tu\tv\tVT\tVE\t|VE-VT|\t允许误差\t得分" << endl;
-        idx = 0;
-        for (auto& er : results) {
-            if (er.valid) {
-                idx++;
-                fout << idx << "\t0x" << hex << setw(8) << setfill('0') << er.u
-                     << "\t0x" << setw(8) << setfill('0') << er.v << dec
-                     << "\t" << setprecision(10) << er.vt
-                     << "\t" << setprecision(10) << er.ve
-                     << "\t" << er.abs_err
-                     << "\t" << er.rel_bound
-                     << "\t" << er.score << endl;
-            }
+    if (mode == "dump-single-active-mask" && argc >= 5) {
+        const int rounds = stoi(argv[2]);
+        const int pos = stoi(argv[3]);
+        const int nib = stoi(argv[4]);
+        if (pos < 0 || pos >= 8) {
+            cerr << "pos must be in [0,7]\n";
+            return 1;
         }
-        fout.close();
-        cout << endl << "结果已保存至 batch_results_r" << r << ".txt" << endl;
+        if (nib < 1 || nib > 15) {
+            cerr << "nib must be in [1,15]\n";
+            return 1;
+        }
 
+        ostream* out = &cout;
+        ofstream fout;
+        if (argc >= 6) {
+            fout.open(argv[5], ios::out | ios::trunc);
+            out = &fout;
+        }
+
+        const u32 u = static_cast<u32>(nib) << (28 - 4 * pos);
+        ONE_ROUND_CACHE.clear();
+        const double min_abs = 1.0 / pow(4.0, rounds);
+        const auto distribution = exact_distribution(u, rounds);
+        vector<Entry> entries;
+        for (const auto& [v, corr] : distribution) {
+            if (u == 0U || v == 0U) {
+                continue;
+            }
+            if (fabs(corr) <= min_abs) {
+                continue;
+            }
+            entries.push_back({rounds, u, v, corr, corr, compute_score(corr, rounds)});
+        }
+        sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+            if (a.score != b.score) {
+                return a.score > b.score;
+            }
+            return a.v < b.v;
+        });
+        *out << fixed << setprecision(15);
+        for (const auto& entry : entries) {
+            *out << "@(" << entry.rounds
+                 << ", 0x" << hex << setw(8) << setfill('0') << uppercase << entry.u
+                 << ", 0x" << setw(8) << entry.v
+                 << dec << nouppercase << setfill(' ')
+                 << ", " << entry.ve
+                 << ", " << entry.vt
+                 << ")\n";
+        }
         return 0;
     }
 
     print_usage();
-    return 0;
+    return 1;
 }

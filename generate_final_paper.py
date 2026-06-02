@@ -13,6 +13,10 @@ from docx.oxml import parse_xml
 import os
 from pathlib import Path
 
+ROOT_DIR = Path(__file__).resolve().parent
+FIGURES_DIR = ROOT_DIR / "figures"
+OUTPUT_DOC = ROOT_DIR / "论文_矩阵连乘元素的逼近.docx"
+
 # ============================================================
 # 字体常量
 # ============================================================
@@ -293,7 +297,7 @@ def generate_final_paper():
 
     add_body(doc, "HS(r)密码结构的整体流程如图1所示。")
 
-    add_image(doc, "E:/gaoxiaom/figures/fig1_hs_structure.png", Inches(5.5))
+    add_image(doc, str(FIGURES_DIR / "fig1_hs_structure.png"), Inches(5.5))
     add_fpara(doc, "图1  HS(r)密码算法结构图", FONT_SONG, Pt(10),
               alignment=WD_ALIGN_PARAGRAPH.CENTER)
 
@@ -371,7 +375,7 @@ def generate_final_paper():
         "对于r=4，由于中间支持集明显增大，算法启用波束宽度B=50000的剪枝策略，保留贡献最大的中间掩码。"
         "这种候选生成方式避免了随机搜索的低命中率，同时不改变方式2对任意给定(u,v,r)的通用性。")
 
-    add_image(doc, "E:/gaoxiaom/figures/fig4_algorithm_flowchart.png", Inches(4.0))
+    add_image(doc, str(FIGURES_DIR / "fig4_algorithm_flowchart.png"), Inches(4.0))
     add_fpara(doc, "图2  主导路线枚举逼近算法流程图", FONT_SONG, Pt(10),
               alignment=WD_ALIGN_PARAGRAPH.CENTER)
 
@@ -389,7 +393,7 @@ def generate_final_paper():
         "算法复杂度仍远低于方式1的O(2^32)。"
         "图4详细对比了方式1和方式2的复杂度差异。")
 
-    add_image(doc, "E:/gaoxiaom/figures/fig3_complexity.png", Inches(5.0))
+    add_image(doc, str(FIGURES_DIR / "fig3_complexity.png"), Inches(5.0))
     add_fpara(doc, "图3  方式1与方式2复杂度对比", FONT_SONG, Pt(10),
               alignment=WD_ALIGN_PARAGRAPH.CENTER)
 
@@ -565,11 +569,11 @@ def generate_final_paper():
         "对于r=4剪枝样例，论文只报告方式2输出的VE和对应得分，并保留原始程序与结果文件，便于在更大波束宽度或更长运行时间下复核。"
         "这种处理方式使结论边界清晰：已完整验证的条目用于证明算法公式和掩码传播正确，剪枝条目用于展示方式2在更高轮数下仍能产生非零估计值。")
 
-    add_image(doc, "E:/gaoxiaom/figures/fig2_correlation_decay.png", Inches(5.5))
+    add_image(doc, str(FIGURES_DIR / "fig2_correlation_decay.png"), Inches(5.5))
     add_fpara(doc, "图4  相关度衰减与得分变化趋势", FONT_SONG, Pt(10),
               alignment=WD_ALIGN_PARAGRAPH.CENTER)
 
-    add_image(doc, "E:/gaoxiaom/figures/fig5_score_distribution.png", Inches(5.0))
+    add_image(doc, str(FIGURES_DIR / "fig5_score_distribution.png"), Inches(5.0))
     add_fpara(doc, "图5  各轮数有效估计值得分分布", FONT_SONG, Pt(10),
               alignment=WD_ALIGN_PARAGRAPH.CENTER)
 
@@ -631,10 +635,9 @@ def generate_final_paper():
     add_page_numbers(doc)
 
     # 保存
-    output = "E:/gaoxiaom/论文_矩阵连乘元素的逼近.docx"
-    doc.save(output)
-    print(f"论文已保存至: {output}")
-    return output
+    doc.save(OUTPUT_DOC)
+    print(f"论文已保存至: {OUTPUT_DOC}")
+    return str(OUTPUT_DOC)
 
 if __name__ == "__main__":
     generate_final_paper()
