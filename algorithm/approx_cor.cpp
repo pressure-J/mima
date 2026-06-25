@@ -44,6 +44,7 @@ int LAT[16][16];
 double LAT_NORM[16][16];
 vector<pair<int, double>> NONZERO_LAT[16];
 unordered_map<u32, vector<Transition>> ONE_ROUND_CACHE;
+unordered_map<u32, vector<Transition>> ONE_ROUND_BACKWARD_CACHE;
 
 inline int active_nibbles(u32 x) {
     int count = 0;
@@ -91,6 +92,19 @@ inline array<int, 8> linear_mask_forward(const array<int, 8>& c) {
     };
 }
 
+inline array<int, 8> linear_mask_backward(const array<int, 8>& b) {
+    return {
+        b[0] ^ b[1] ^ b[3],
+        b[6],
+        b[0] ^ b[2] ^ b[3],
+        b[4],
+        b[4] ^ b[5] ^ b[7],
+        b[2],
+        b[4] ^ b[6] ^ b[7],
+        b[0],
+    };
+}
+
 void compute_lat() {
     for (int a = 0; a < 16; ++a) {
         NONZERO_LAT[a].clear();
@@ -109,6 +123,12 @@ void compute_lat() {
                 NONZERO_LAT[a].push_back({b, LAT_NORM[a][b]});
             }
         }
+        sort(NONZERO_LAT[a].begin(), NONZERO_LAT[a].end(), [](const auto& x, const auto& y) {
+            if (fabs(x.second) != fabs(y.second)) {
+                return fabs(x.second) > fabs(y.second);
+            }
+            return x.first < y.first;
+        });
     }
 }
 
@@ -157,6 +177,75 @@ vector<Transition> build_one_round(u32 input_mask) {
     return transitions;
 }
 
+void keep_top_transitions(vector<Transition>& transitions, size_t limit) {
+    if (limit == 0 || transitions.size() <= limit) {
+        return;
+    }
+    nth_element(transitions.begin(), transitions.begin() + static_cast<long long>(limit), transitions.end(),
+                [](const Transition& a, const Transition& b) {
+                    if (fabs(a.corr) != fabs(b.corr)) {
+                        return fabs(a.corr) > fabs(b.corr);
+                    }
+                    return a.mask < b.mask;
+                });
+    transitions.resize(limit);
+}
+
+vector<Transition> build_one_round_limited(u32 input_mask, size_t branch_limit, size_t transition_limit) {
+    if (branch_limit == 0) {
+        auto transitions = build_one_round(input_mask);
+        keep_top_transitions(transitions, transition_limit);
+        return transitions;
+    }
+
+    const array<int, 8> in = split_nibbles(input_mask);
+    array<int, 8> sbox_out{};
+    unordered_map<u32, double> merged;
+
+    function<void(int, double)> dfs = [&](int pos, double corr) {
+        if (pos == 8) {
+            const u32 next_mask = pack_nibbles(linear_mask_forward(sbox_out));
+            if (next_mask != 0U) {
+                merged[next_mask] += corr;
+            }
+            return;
+        }
+
+        const int nib = in[pos];
+        if (nib == 0) {
+            sbox_out[pos] = 0;
+            dfs(pos + 1, corr);
+            return;
+        }
+
+        const auto& choices = NONZERO_LAT[nib];
+        const size_t count = min(branch_limit, choices.size());
+        for (size_t i = 0; i < count; ++i) {
+            const auto& [out_mask, sbox_corr] = choices[i];
+            sbox_out[pos] = out_mask;
+            dfs(pos + 1, corr * sbox_corr);
+        }
+    };
+
+    dfs(0, 1.0);
+
+    vector<Transition> transitions;
+    transitions.reserve(merged.size());
+    for (const auto& [mask, corr] : merged) {
+        if (fabs(corr) > 1e-18) {
+            transitions.push_back({mask, corr});
+        }
+    }
+    sort(transitions.begin(), transitions.end(), [](const Transition& a, const Transition& b) {
+        if (fabs(a.corr) != fabs(b.corr)) {
+            return fabs(a.corr) > fabs(b.corr);
+        }
+        return a.mask < b.mask;
+    });
+    keep_top_transitions(transitions, transition_limit);
+    return transitions;
+}
+
 const vector<Transition>& enumerate_one_round(u32 input_mask) {
     auto cached = ONE_ROUND_CACHE.find(input_mask);
     if (cached != ONE_ROUND_CACHE.end()) {
@@ -164,6 +253,56 @@ const vector<Transition>& enumerate_one_round(u32 input_mask) {
     }
 
     return ONE_ROUND_CACHE.emplace(input_mask, build_one_round(input_mask)).first->second;
+}
+
+vector<Transition> build_one_round_backward(u32 output_mask) {
+    const array<int, 8> out = split_nibbles(output_mask);
+    const array<int, 8> sbox_out = linear_mask_backward(out);
+    array<int, 8> input{};
+    unordered_map<u32, double> merged;
+
+    function<void(int, double)> dfs = [&](int pos, double corr) {
+        if (pos == 8) {
+            merged[pack_nibbles(input)] += corr;
+            return;
+        }
+
+        const int c = sbox_out[pos];
+        for (int a = 0; a < 16; ++a) {
+            const double sbox_corr = LAT_NORM[a][c];
+            if (sbox_corr == 0.0) {
+                continue;
+            }
+            input[pos] = a;
+            dfs(pos + 1, corr * sbox_corr);
+        }
+    };
+
+    dfs(0, 1.0);
+
+    vector<Transition> transitions;
+    transitions.reserve(merged.size());
+    for (const auto& [mask, corr] : merged) {
+        if (fabs(corr) > 1e-18) {
+            transitions.push_back({mask, corr});
+        }
+    }
+    sort(transitions.begin(), transitions.end(), [](const Transition& a, const Transition& b) {
+        if (fabs(a.corr) != fabs(b.corr)) {
+            return fabs(a.corr) > fabs(b.corr);
+        }
+        return a.mask < b.mask;
+    });
+    return transitions;
+}
+
+const vector<Transition>& enumerate_one_round_backward(u32 output_mask) {
+    auto cached = ONE_ROUND_BACKWARD_CACHE.find(output_mask);
+    if (cached != ONE_ROUND_BACKWARD_CACHE.end()) {
+        return cached->second;
+    }
+
+    return ONE_ROUND_BACKWARD_CACHE.emplace(output_mask, build_one_round_backward(output_mask)).first->second;
 }
 
 unordered_map<u32, double> exact_distribution(u32 u, int rounds, size_t max_states = 200000) {
@@ -205,6 +344,166 @@ unordered_map<u32, double> exact_distribution(u32 u, int rounds, size_t max_stat
             }
         }
 
+        current = move(next);
+    }
+
+    return current;
+}
+
+unordered_map<u32, double> exact_backward_distribution(u32 v, int rounds) {
+    unordered_map<u32, double> current;
+    current.reserve(1024);
+    current[v] = 1.0;
+
+    for (int r = 0; r < rounds; ++r) {
+        unordered_map<u32, double> next;
+        next.reserve(current.size() * 8);
+
+        for (const auto& [mask, corr] : current) {
+            const auto& transitions = enumerate_one_round_backward(mask);
+            for (const auto& transition : transitions) {
+                next[transition.mask] += corr * transition.corr;
+            }
+        }
+
+        for (auto it = next.begin(); it != next.end();) {
+            if (fabs(it->second) <= 1e-18) {
+                it = next.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        current = move(next);
+    }
+
+    return current;
+}
+
+double exact_value_mitm(u32 u, u32 v, int rounds) {
+    if (rounds <= 3) {
+        const auto distribution = exact_distribution(u, rounds);
+        auto it = distribution.find(v);
+        return it == distribution.end() ? 0.0 : it->second;
+    }
+
+    const int left_rounds = rounds / 2;
+    const int right_rounds = rounds - left_rounds;
+    const auto left = exact_distribution(u, left_rounds);
+    const auto right = exact_backward_distribution(v, right_rounds);
+
+    const auto* smaller = &left;
+    const auto* larger = &right;
+    if (right.size() < left.size()) {
+        smaller = &right;
+        larger = &left;
+    }
+
+    double total = 0.0;
+    for (const auto& [mask, corr] : *smaller) {
+        auto it = larger->find(mask);
+        if (it != larger->end()) {
+            total += corr * it->second;
+        }
+    }
+    return total;
+}
+
+void keep_top_by_abs(unordered_map<u32, double>& values, size_t limit) {
+    if (limit == 0 || values.size() <= limit) {
+        return;
+    }
+
+    vector<pair<u32, double>> ranked(values.begin(), values.end());
+    nth_element(ranked.begin(), ranked.begin() + static_cast<long long>(limit), ranked.end(),
+                [](const auto& a, const auto& b) {
+                    if (fabs(a.second) != fabs(b.second)) {
+                        return fabs(a.second) > fabs(b.second);
+                    }
+                    return a.first < b.first;
+                });
+    ranked.resize(limit);
+
+    values.clear();
+    values.reserve(limit * 2);
+    for (const auto& [mask, corr] : ranked) {
+        values[mask] = corr;
+    }
+}
+
+unordered_map<u32, double> beam_distribution(u32 u, int rounds, size_t beam_width) {
+    unordered_map<u32, double> current;
+    current.reserve(1024);
+    current[u] = 1.0;
+
+    for (int r = 0; r < rounds; ++r) {
+        unordered_map<u32, double> next;
+        next.reserve(min<size_t>(beam_width * 16, 1'000'000));
+
+        for (const auto& [mask, corr] : current) {
+            if (active_nibbles(mask) <= 2) {
+                const auto& transitions = enumerate_one_round(mask);
+                for (const auto& transition : transitions) {
+                    next[transition.mask] += corr * transition.corr;
+                }
+            } else {
+                const auto transitions = build_one_round(mask);
+                for (const auto& transition : transitions) {
+                    next[transition.mask] += corr * transition.corr;
+                }
+            }
+        }
+
+        for (auto it = next.begin(); it != next.end();) {
+            if (fabs(it->second) <= 1e-18) {
+                it = next.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        keep_top_by_abs(next, beam_width);
+        current = move(next);
+    }
+
+    return current;
+}
+
+unordered_map<u32, double> beam_distribution_fast(
+    u32 u,
+    int rounds,
+    size_t beam_width,
+    size_t branch_limit,
+    size_t transition_limit
+) {
+    unordered_map<u32, double> current;
+    current.reserve(1024);
+    current[u] = 1.0;
+
+    for (int r = 0; r < rounds; ++r) {
+        unordered_map<u32, double> next;
+        next.reserve(min<size_t>(beam_width * max<size_t>(transition_limit, 1), 1'000'000));
+
+        for (const auto& [mask, corr] : current) {
+            vector<Transition> transitions;
+            if (active_nibbles(mask) <= 2 && branch_limit == 0 && transition_limit == 0) {
+                const auto& cached = enumerate_one_round(mask);
+                transitions.assign(cached.begin(), cached.end());
+            } else {
+                transitions = build_one_round_limited(mask, branch_limit, transition_limit);
+            }
+            for (const auto& transition : transitions) {
+                next[transition.mask] += corr * transition.corr;
+            }
+        }
+
+        for (auto it = next.begin(); it != next.end();) {
+            if (fabs(it->second) <= 1e-18) {
+                it = next.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        keep_top_by_abs(next, beam_width);
         current = move(next);
     }
 
@@ -277,6 +576,156 @@ vector<u32> single_active_inputs() {
         }
     }
     return masks;
+}
+
+vector<Entry> beam_verified_entries(int rounds, size_t beam_width, size_t top_per_u, double min_score) {
+    const auto inputs = single_active_inputs();
+    vector<Entry> entries;
+
+    for (u32 u : inputs) {
+        ONE_ROUND_CACHE.clear();
+        ONE_ROUND_BACKWARD_CACHE.clear();
+
+        auto candidates = beam_distribution(u, rounds, beam_width);
+        vector<pair<u32, double>> ranked(candidates.begin(), candidates.end());
+        sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+            if (fabs(a.second) != fabs(b.second)) {
+                return fabs(a.second) > fabs(b.second);
+            }
+            return a.first < b.first;
+        });
+        if (ranked.size() > top_per_u) {
+            ranked.resize(top_per_u);
+        }
+
+        for (const auto& [v, _] : ranked) {
+            if (u == 0U || v == 0U) {
+                continue;
+            }
+            ONE_ROUND_CACHE.clear();
+            ONE_ROUND_BACKWARD_CACHE.clear();
+            const double vt = exact_value_mitm(u, v, rounds);
+            if (vt == 0.0) {
+                continue;
+            }
+            const double score = compute_score(vt, rounds);
+            if (score < min_score) {
+                continue;
+            }
+            entries.push_back({rounds, u, v, vt, vt, score});
+        }
+    }
+
+    sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+        if (a.rounds != b.rounds) {
+            return a.rounds < b.rounds;
+        }
+        if (a.score != b.score) {
+            return a.score > b.score;
+        }
+        if (a.u != b.u) {
+            return a.u < b.u;
+        }
+        return a.v < b.v;
+    });
+    return entries;
+}
+
+vector<Entry> beam_estimate_entries(int rounds, size_t beam_width, size_t top_per_u, double min_score) {
+    const auto inputs = single_active_inputs();
+    vector<Entry> entries;
+
+    for (u32 u : inputs) {
+        ONE_ROUND_CACHE.clear();
+        auto candidates = beam_distribution(u, rounds, beam_width);
+        vector<pair<u32, double>> ranked(candidates.begin(), candidates.end());
+        sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+            if (fabs(a.second) != fabs(b.second)) {
+                return fabs(a.second) > fabs(b.second);
+            }
+            return a.first < b.first;
+        });
+        if (ranked.size() > top_per_u) {
+            ranked.resize(top_per_u);
+        }
+
+        for (const auto& [v, ve] : ranked) {
+            if (u == 0U || v == 0U || ve == 0.0) {
+                continue;
+            }
+            const double score = compute_score(ve, rounds);
+            if (score < min_score) {
+                continue;
+            }
+            entries.push_back({rounds, u, v, ve, ve, score});
+        }
+    }
+
+    sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+        if (a.rounds != b.rounds) {
+            return a.rounds < b.rounds;
+        }
+        if (a.score != b.score) {
+            return a.score > b.score;
+        }
+        if (a.u != b.u) {
+            return a.u < b.u;
+        }
+        return a.v < b.v;
+    });
+    return entries;
+}
+
+vector<Entry> beam_fast_entries(
+    int rounds,
+    size_t beam_width,
+    size_t top_per_u,
+    double min_score,
+    size_t branch_limit,
+    size_t transition_limit
+) {
+    const auto inputs = single_active_inputs();
+    vector<Entry> entries;
+
+    for (u32 u : inputs) {
+        ONE_ROUND_CACHE.clear();
+        auto candidates = beam_distribution_fast(u, rounds, beam_width, branch_limit, transition_limit);
+        vector<pair<u32, double>> ranked(candidates.begin(), candidates.end());
+        sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+            if (fabs(a.second) != fabs(b.second)) {
+                return fabs(a.second) > fabs(b.second);
+            }
+            return a.first < b.first;
+        });
+        if (ranked.size() > top_per_u) {
+            ranked.resize(top_per_u);
+        }
+
+        for (const auto& [v, ve] : ranked) {
+            if (u == 0U || v == 0U || ve == 0.0) {
+                continue;
+            }
+            const double score = compute_score(ve, rounds);
+            if (score < min_score) {
+                continue;
+            }
+            entries.push_back({rounds, u, v, ve, ve, score});
+        }
+    }
+
+    sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+        if (a.rounds != b.rounds) {
+            return a.rounds < b.rounds;
+        }
+        if (a.score != b.score) {
+            return a.score > b.score;
+        }
+        if (a.u != b.u) {
+            return a.u < b.u;
+        }
+        return a.v < b.v;
+    });
+    return entries;
 }
 
 vector<Entry> search_positive_score_entries(int max_rounds) {
@@ -438,6 +887,22 @@ void write_estimates(const vector<Entry>& entries) {
     cout << "Total score: " << fixed << setprecision(4) << total_score << "\n";
 }
 
+void write_entries_txt(const vector<Entry>& entries, const filesystem::path& path) {
+    ofstream out(path, ios::out | ios::trunc);
+    out << "# Valid estimates generated by sparse beam search plus MITM verification\n";
+    out << "# Format required by the problem statement: @(r, u, v, VE, VT)\n";
+    out << fixed << setprecision(15);
+    for (const auto& entry : entries) {
+        out << "@(" << entry.rounds
+            << ", 0x" << hex << setw(8) << setfill('0') << uppercase << entry.u
+            << ", 0x" << setw(8) << entry.v
+            << dec << nouppercase << setfill(' ')
+            << ", " << entry.ve
+            << ", " << entry.vt
+            << ")\n";
+    }
+}
+
 string to_hex(u32 value) {
     stringstream ss;
     ss << "0x" << hex << setw(8) << setfill('0') << uppercase << value;
@@ -452,6 +917,10 @@ void print_usage() {
     cout << "  approx_cor dump-single-active <r> [output_path]\n";
     cout << "  approx_cor dump-single-active-pos <r> <pos> [output_path]\n";
     cout << "  approx_cor dump-single-active-mask <r> <pos> <nib> [output_path]\n";
+    cout << "  approx_cor beam <r> <beam_width> <top_per_u> <min_score> [output_path]\n";
+    cout << "  approx_cor beam-estimate <r> <beam_width> <top_per_u> <min_score> [output_path]\n";
+    cout << "  approx_cor beam-fast <r> <beam_width> <top_per_u> <min_score> <branch_limit> <transition_limit> [output_path]\n";
+    cout << "  approx_cor exact-mitm <u> <v> <r>\n";
     cout << "  approx_cor search <max_rounds>\n";
     cout << "\n";
     cout << "Notes:\n";
@@ -461,6 +930,10 @@ void print_usage() {
     cout << "  dump-single-active : dump all positive-score exact entries for all single-active inputs\n";
     cout << "  dump-single-active-pos : dump all positive-score exact entries for one active position\n";
     cout << "  dump-single-active-mask : dump all positive-score exact entries for one active position and nibble\n";
+    cout << "  beam  : find R>=4 candidates with beam search, then verify with sparse MITM composition\n";
+    cout << "  beam-estimate : fast R>=4 beam estimates without expensive MITM verification\n";
+    cout << "  beam-fast : fastest R>=4 search; limits per-S-box branches and per-mask transitions\n";
+    cout << "  exact-mitm : exact sparse meet-in-the-middle correlation for one pair\n";
     cout << "  search: enumerate all positive-score entries for single-active input masks\n";
 }
 
@@ -505,6 +978,93 @@ int main(int argc, char* argv[]) {
         if (vt != 0.0) {
             cout << "score = " << compute_score(vt, rounds) << "\n";
         }
+        return 0;
+    }
+
+    if (mode == "exact-mitm" && argc >= 5) {
+        const u32 u = static_cast<u32>(stoul(argv[2], nullptr, 16));
+        const u32 v = static_cast<u32>(stoul(argv[3], nullptr, 16));
+        const int rounds = stoi(argv[4]);
+        ONE_ROUND_CACHE.clear();
+        ONE_ROUND_BACKWARD_CACHE.clear();
+        const double vt = exact_value_mitm(u, v, rounds);
+        cout << "u  = " << to_hex(u) << "\n";
+        cout << "v  = " << to_hex(v) << "\n";
+        cout << "r  = " << rounds << "\n";
+        cout << setprecision(15);
+        cout << "VT = " << vt << "\n";
+        if (vt != 0.0) {
+            cout << "score = " << compute_score(vt, rounds) << "\n";
+        }
+        return 0;
+    }
+
+    if (mode == "beam" && argc >= 6) {
+        const int rounds = stoi(argv[2]);
+        const size_t beam_width = static_cast<size_t>(stoull(argv[3]));
+        const size_t top_per_u = static_cast<size_t>(stoull(argv[4]));
+        const double min_score = stod(argv[5]);
+        const auto entries = beam_verified_entries(rounds, beam_width, top_per_u, min_score);
+        if (argc >= 7) {
+            write_entries_txt(entries, argv[6]);
+            cout << "Wrote " << entries.size() << " entries to " << argv[6] << "\n";
+        } else {
+            write_estimates(entries);
+        }
+        double total_score = 0.0;
+        for (const auto& entry : entries) {
+            total_score += entry.score;
+        }
+        cout << "Total score: " << fixed << setprecision(4) << total_score << "\n";
+        return 0;
+    }
+
+    if (mode == "beam-estimate" && argc >= 6) {
+        const int rounds = stoi(argv[2]);
+        const size_t beam_width = static_cast<size_t>(stoull(argv[3]));
+        const size_t top_per_u = static_cast<size_t>(stoull(argv[4]));
+        const double min_score = stod(argv[5]);
+        const auto entries = beam_estimate_entries(rounds, beam_width, top_per_u, min_score);
+        if (argc >= 7) {
+            write_entries_txt(entries, argv[6]);
+            cout << "Wrote " << entries.size() << " entries to " << argv[6] << "\n";
+        } else {
+            write_estimates(entries);
+        }
+        double total_score = 0.0;
+        for (const auto& entry : entries) {
+            total_score += entry.score;
+        }
+        cout << "Total score: " << fixed << setprecision(4) << total_score << "\n";
+        return 0;
+    }
+
+    if (mode == "beam-fast" && argc >= 8) {
+        const int rounds = stoi(argv[2]);
+        const size_t beam_width = static_cast<size_t>(stoull(argv[3]));
+        const size_t top_per_u = static_cast<size_t>(stoull(argv[4]));
+        const double min_score = stod(argv[5]);
+        const size_t branch_limit = static_cast<size_t>(stoull(argv[6]));
+        const size_t transition_limit = static_cast<size_t>(stoull(argv[7]));
+        const auto entries = beam_fast_entries(
+            rounds,
+            beam_width,
+            top_per_u,
+            min_score,
+            branch_limit,
+            transition_limit
+        );
+        if (argc >= 9) {
+            write_entries_txt(entries, argv[8]);
+            cout << "Wrote " << entries.size() << " entries to " << argv[8] << "\n";
+        } else {
+            write_estimates(entries);
+        }
+        double total_score = 0.0;
+        for (const auto& entry : entries) {
+            total_score += entry.score;
+        }
+        cout << "Total score: " << fixed << setprecision(4) << total_score << "\n";
         return 0;
     }
 
